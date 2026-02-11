@@ -1,5 +1,6 @@
 import os
 import requests
+import re
 from rich.console import Console
 from rich.prompt import Prompt
 from rich.progress import Progress, SpinnerColumn, DownloadColumn, TransferSpeedColumn, TextColumn, TimeRemainingColumn
@@ -22,13 +23,39 @@ def list_loras():
 
     return loras
 
-def download_file(url, filename):
-    """Download a file with progress bar."""
-    path = os.path.join(LORA_DIR, filename)
+def get_filename_from_cd(cd):
+    """Get filename from content-disposition."""
+    if not cd:
+        return None
+    fname = re.findall('filename="?([^"]+)"?', cd)
+    if len(fname) == 0:
+        return None
+    return fname[0]
+
+def download_file(url, filename=None):
+    """Download a file with progress bar and auto-naming."""
 
     try:
-        with requests.get(url, stream=True) as r:
+        with requests.get(url, stream=True, allow_redirects=True) as r:
             r.raise_for_status()
+
+            # Try to guess filename if not provided
+            if not filename or filename == "lora.safetensors":
+                cd = r.headers.get("content-disposition")
+                guessed_name = get_filename_from_cd(cd)
+                if guessed_name:
+                    filename = guessed_name
+                    console.print(f"[dim]Detected filename: {filename}[/dim]")
+                else:
+                    if "lora.safetensors" in filename:
+                        url_name = url.split("/")[-1].split("?")[0]
+                        if "." in url_name:
+                            filename = url_name
+
+            if not filename:
+                filename = Prompt.ask("Enter filename to save as (e.g. style.safetensors)")
+
+            path = os.path.join(LORA_DIR, filename)
             total_size = int(r.headers.get('content-length', 0))
 
             with Progress(
@@ -69,23 +96,18 @@ def download_from_hf(repo_id, filename):
 def download_menu():
     console.print("[bold cyan]LoRA Downloader[/bold cyan]")
     console.print("1. Hugging Face (Repo ID + Filename)")
-    console.print("2. URL (Direct Link)")
+    console.print("2. URL (Civitai, Direct Link, etc.)")
     console.print("0. Back")
 
     choice = Prompt.ask("Select source", choices=["1", "2", "0"], default="1")
 
     if choice == "1":
         repo_id = Prompt.ask("Enter HF Repo ID (e.g. 'segmind/tiny-sd-lora')")
-        # List files in repo? Too complex for simple script. Just ask filename.
         filename = Prompt.ask("Enter filename (e.g. 'pytorch_lora_weights.safetensors')")
         download_from_hf(repo_id, filename)
     elif choice == "2":
         url = Prompt.ask("Enter Direct URL")
-        filename = url.split("/")[-1]
-        if "?" in filename: filename = filename.split("?")[0]
-        if not filename.endswith(".safetensors"):
-            filename = Prompt.ask("Enter filename to save as", default="lora.safetensors")
-        download_file(url, filename)
+        download_file(url, "lora.safetensors")
 
 if __name__ == "__main__":
     while True:
