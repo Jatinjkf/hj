@@ -75,15 +75,18 @@ def get_pipeline(pipe_type, device_key, width=512, height=512, batch_size=1, sch
             new_dims = (width, height, batch_size)
 
             if current_dims == new_dims:
-                # Fully cached
+                # Fully cached, shape matches
                 utils.configure_scheduler(CACHED_PIPELINE, scheduler_name)
                 return CACHED_PIPELINE
             else:
                 # Dimensions changed, reshape
+                # Note: This is NOT a re-conversion (export). It's a reshaping of the loaded IR model.
                 console.print(f"[dim]Reshaping OpenVINO model from {current_dims} to {new_dims}...[/dim]")
                 try:
                     CACHED_PIPELINE.reshape(batch_size=1, height=height, width=width, num_images_per_prompt=batch_size)
                     ov_device = "GPU" if device_key == "openvino_gpu" else "CPU"
+                    # Compiling: This uses OV_CACHE_DIR, so if this shape was seen before, it loads the blob (fast).
+                    # If new shape, it compiles (slow).
                     CACHED_PIPELINE.compile()
 
                     CACHED_CONFIG.update({"width": width, "height": height, "batch_size": batch_size})
@@ -95,7 +98,7 @@ def get_pipeline(pipe_type, device_key, width=512, height=512, batch_size=1, sch
             utils.configure_scheduler(CACHED_PIPELINE, scheduler_name)
             return CACHED_PIPELINE
 
-    # Load new pipeline
+    # Load new pipeline (Model changed or Device changed)
     model_name_clean = os.path.basename(CURRENT_MODEL_PATH).replace(".safetensors", "").replace(".ckpt", "").replace(":", "_")
     if CURRENT_MODEL_TYPE == "hf_id":
         model_name_clean = CURRENT_MODEL_PATH.split("/")[-1]
@@ -116,27 +119,26 @@ def get_pipeline(pipe_type, device_key, width=512, height=512, batch_size=1, sch
         with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), transient=True) as progress:
             progress.add_task(description=f"Loading {model_name_clean} (OpenVINO {ov_device})...", total=None)
             try:
+                # Enable compilation caching on disk
                 ov_config = {"CACHE_DIR": OV_CACHE_DIR}
 
                 if is_ov_cached:
+                    # Load from local directory (Already converted)
                     if pipe_type == "txt2img":
                         pipe = OVStableDiffusionPipeline.from_pretrained(model_ov_dir, ov_config=ov_config)
                     else:
                         pipe = OVStableDiffusionImg2ImgPipeline.from_pretrained(model_ov_dir, ov_config=ov_config)
                 else:
-                    # Conversion required
-                    console.print(f"[yellow]Converting {model_name_clean} to OpenVINO...[/yellow]")
+                    # Conversion required (PyTorch -> OpenVINO IR)
+                    console.print(f"[yellow]Converting {model_name_clean} to OpenVINO... (First time only)[/yellow]")
 
                     # Logic to load source for conversion
                     if CURRENT_MODEL_TYPE == "file":
-                        # Load from single file then export
                         pt_pipe_cls = StableDiffusionPipeline
                         pipe = OVStableDiffusionPipeline.from_single_file(CURRENT_MODEL_PATH, export=True, ov_config=ov_config)
                     elif CURRENT_MODEL_TYPE == "folder":
                         pipe = OVStableDiffusionPipeline.from_pretrained(CURRENT_MODEL_PATH, export=True, ov_config=ov_config)
                     else: # hf_id
-                        # Standard HF ID download & export
-                        # Use robust fallback if direct fails
                         try:
                             pipe = OVStableDiffusionPipeline.from_pretrained(CURRENT_MODEL_PATH, export=True, ov_config=ov_config)
                         except:
@@ -144,13 +146,15 @@ def get_pipeline(pipe_type, device_key, width=512, height=512, batch_size=1, sch
                              pt_pipe = StableDiffusionPipeline.from_pretrained(CURRENT_MODEL_PATH, use_safetensors=False)
                              pipe = OVStableDiffusionPipeline.from_pipe(pt_pipe, export=True, ov_config=ov_config)
 
-                    # Save converted
+                    # Save converted model so we don't convert again
                     pipe.save_pretrained(model_ov_dir)
                     console.print(f"[bold green]Saved OpenVINO model to {model_ov_dir}[/bold green]")
 
                 utils.configure_scheduler(pipe, scheduler_name)
+                # Reshape to specific static dimensions
                 pipe.reshape(batch_size=1, height=height, width=width, num_images_per_prompt=batch_size)
                 pipe.to(ov_device)
+                # Compilation (Load IR to device)
                 pipe.compile()
 
                 CACHED_PIPELINE = pipe
@@ -301,6 +305,7 @@ def run_task(task_name, device_key):
         if not init_image: return
 
         orig_w, orig_h = init_image.size
+        # Round dimensions to 64 for OpenVINO compatibility
         width = (orig_w // 64) * 64
         height = (orig_h // 64) * 64
         console.print(f"[dim]Using image dimensions: {width}x{height}[/dim]")
