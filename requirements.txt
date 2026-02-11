@@ -1,0 +1,9 @@
+torch
+diffusers>=0.21.0
+transformers
+accelerate
+Pillow
+numpy
+requests
+safetensors
+rich
