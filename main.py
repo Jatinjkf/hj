@@ -11,6 +11,10 @@ from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich.markdown import Markdown
 import requests
 from io import BytesIO
+import utils
+
+# Suppress warnings
+utils.suppress_warnings()
 
 console = Console()
 
@@ -33,20 +37,27 @@ def get_pipeline(pipe_type="txt2img"):
         transient=True,
     ) as progress:
         progress.add_task(description=f"Loading Tiny-SD ({pipe_type})...", total=None)
-        if pipe_type == "txt2img":
-            pipe = StableDiffusionPipeline.from_pretrained(model_id, torch_dtype=torch.float32)
-        else:
-            pipe = StableDiffusionImg2ImgPipeline.from_pretrained(model_id, torch_dtype=torch.float32)
+
+        PipelineClass = StableDiffusionPipeline if pipe_type == "txt2img" else StableDiffusionImg2ImgPipeline
+
+        try:
+            pipe = PipelineClass.from_pretrained(model_id, torch_dtype=torch.float32, use_safetensors=True)
+        except Exception as e:
+            console.print(f"[yellow]Safetensors load failed ({e}), falling back to standard weights...[/yellow]")
+            pipe = PipelineClass.from_pretrained(model_id, torch_dtype=torch.float32, use_safetensors=False)
         
         pipe = pipe.to("cpu")
         pipe.enable_attention_slicing()
+        pipe.scheduler = utils.get_optimal_scheduler(pipe)
+
     return pipe
 
 def run_txt2img():
     console.print(Panel("[bold cyan]Text-to-Image Mode[/bold cyan]"))
     prompt = Prompt.ask("Enter your prompt", default="A magical forest at night")
-    steps = IntPrompt.ask("Inference steps", default=20)
+    steps = IntPrompt.ask("Inference steps", default=15)
     output = Prompt.ask("Output filename", default="output_txt2img.png")
+    output = utils.ensure_extension(output)
     
     pipe = get_pipeline("txt2img")
     
@@ -65,8 +76,9 @@ def run_img2img():
 
     prompt = Prompt.ask("Enter prompt for transformation", default="Cyberpunk style")
     strength = FloatPrompt.ask("Transformation strength (0.0 - 1.0)", default=0.75)
-    steps = IntPrompt.ask("Inference steps", default=20)
+    steps = IntPrompt.ask("Inference steps", default=15)
     output = Prompt.ask("Output filename", default="output_img2img.png")
+    output = utils.ensure_extension(output)
     
     pipe = get_pipeline("img2img")
     init_image = init_image.resize((512, 512))
@@ -90,6 +102,7 @@ def run_inpaint():
     prompt = Prompt.ask("Enter prompt for inpainting")
     strength = FloatPrompt.ask("Strength", default=0.75)
     output = Prompt.ask("Output filename", default="output_inpaint.png")
+    output = utils.ensure_extension(output)
     
     pipe = get_pipeline("img2img")
     
@@ -113,6 +126,7 @@ def run_outpaint():
     prompt = Prompt.ask("Enter prompt describing the full scene")
     padding = IntPrompt.ask("Padding pixels", default=128)
     output = Prompt.ask("Output filename", default="output_outpaint.png")
+    output = utils.ensure_extension(output)
     
     pipe = get_pipeline("img2img")
     
