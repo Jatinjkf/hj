@@ -52,7 +52,7 @@ Choose your accelerator:
 The app will ask you to select a model.
 -   **Default**: `segmind/tiny-sd` (Fast, distilled SD 1.5).
 -   **Download New**: Select this to download any SD 1.5 based model from Hugging Face or Civitai (direct URL).
-    -   Downloaded models are saved to `tiny-sd-models/`.
+    -   Downloaded models are saved to `models/`.
     -   They are automatically converted to OpenVINO format upon first use.
 
 ### 3. Generation
@@ -66,8 +66,20 @@ Select a task (e.g., Text to Image) and follow the prompts.
 
 ## Adding Models Manually
 You can manually place `.safetensors` files or Diffusers folders into:
--   Models: `tiny-sd-models/`
--   LoRAs: `tiny-sd-models/loras/`
+-   Models: `models/`
+-   LoRAs: `models/loras/`
+
+**Supported Files:**
+-   `.safetensors` (Strongly Recommended)
+-   `.ckpt` (Supported but unsafe/legacy)
+-   Diffusers Folders (contain `unet`, `vae`, etc.)
+
+**Where to find models?**
+-   **Hugging Face**: Look for "diffusers" or ".safetensors" files.
+-   **Civitai**: Filter by "SD 1.5" and "Checkpoint" (Models) or "LoRA".
+
+## Learning
+Check out `book.txt` included in this repository for a detailed guide on Generative AI, Parameters, and Prompt Engineering.
 
 ## Troubleshooting
 -   **"OpenVINO Load Error"**: If you see errors about `torch.load` vulnerability, the app will try a fallback method. If that fails, consider upgrading `torch`.

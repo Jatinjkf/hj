@@ -7,7 +7,7 @@ from rich.progress import Progress, SpinnerColumn, DownloadColumn, TransferSpeed
 from huggingface_hub import hf_hub_download
 
 console = Console()
-LORA_DIR = os.path.join("tiny-sd-models", "loras")
+LORA_DIR = os.path.join("models", "loras")
 os.makedirs(LORA_DIR, exist_ok=True)
 
 def list_loras():

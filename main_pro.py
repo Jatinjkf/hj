@@ -14,6 +14,7 @@ import utils
 import shutil
 import model_manager
 import lora_manager
+import hashlib
 
 # Suppress warnings
 utils.suppress_warnings()
@@ -21,7 +22,7 @@ utils.suppress_warnings()
 console = Console()
 
 # Define paths
-LOCAL_MODEL_DIR = "tiny-sd-models"
+LOCAL_MODEL_DIR = "models"
 OV_CACHE_DIR = os.path.join(LOCAL_MODEL_DIR, "openvino_cache")
 
 os.makedirs(LOCAL_MODEL_DIR, exist_ok=True)
@@ -80,13 +81,11 @@ def get_pipeline(pipe_type, device_key, width=512, height=512, batch_size=1, sch
                 return CACHED_PIPELINE
             else:
                 # Dimensions changed, reshape
-                # Note: This is NOT a re-conversion (export). It's a reshaping of the loaded IR model.
                 console.print(f"[dim]Reshaping OpenVINO model from {current_dims} to {new_dims}...[/dim]")
                 try:
                     CACHED_PIPELINE.reshape(batch_size=1, height=height, width=width, num_images_per_prompt=batch_size)
                     ov_device = "GPU" if device_key == "openvino_gpu" else "CPU"
                     # Compiling: This uses OV_CACHE_DIR, so if this shape was seen before, it loads the blob (fast).
-                    # If new shape, it compiles (slow).
                     CACHED_PIPELINE.compile()
 
                     CACHED_CONFIG.update({"width": width, "height": height, "batch_size": batch_size})
@@ -103,8 +102,11 @@ def get_pipeline(pipe_type, device_key, width=512, height=512, batch_size=1, sch
     if CURRENT_MODEL_TYPE == "hf_id":
         model_name_clean = CURRENT_MODEL_PATH.split("/")[-1]
 
+    # Create unique hash for this specific model path to avoid collisions
+    model_hash = hashlib.md5(CURRENT_MODEL_PATH.encode()).hexdigest()[:8]
+
     # Define OpenVINO export path specific to this model
-    model_ov_dir = os.path.join(LOCAL_MODEL_DIR, f"{model_name_clean}_openvino")
+    model_ov_dir = os.path.join(LOCAL_MODEL_DIR, f"{model_name_clean}_{model_hash}_openvino")
 
     # Handle OpenVINO
     if device_key in ["openvino_cpu", "openvino_gpu"]:
@@ -119,7 +121,7 @@ def get_pipeline(pipe_type, device_key, width=512, height=512, batch_size=1, sch
         with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), transient=True) as progress:
             progress.add_task(description=f"Loading {model_name_clean} (OpenVINO {ov_device})...", total=None)
             try:
-                # Enable compilation caching on disk
+                # Enable compilation caching on disk (shared for all models)
                 ov_config = {"CACHE_DIR": OV_CACHE_DIR}
 
                 if is_ov_cached:
@@ -129,7 +131,7 @@ def get_pipeline(pipe_type, device_key, width=512, height=512, batch_size=1, sch
                     else:
                         pipe = OVStableDiffusionImg2ImgPipeline.from_pretrained(model_ov_dir, ov_config=ov_config)
                 else:
-                    # Conversion required (PyTorch -> OpenVINO IR)
+                    # Conversion required
                     console.print(f"[yellow]Converting {model_name_clean} to OpenVINO... (First time only)[/yellow]")
 
                     # Logic to load source for conversion
@@ -146,7 +148,7 @@ def get_pipeline(pipe_type, device_key, width=512, height=512, batch_size=1, sch
                              pt_pipe = StableDiffusionPipeline.from_pretrained(CURRENT_MODEL_PATH, use_safetensors=False)
                              pipe = OVStableDiffusionPipeline.from_pipe(pt_pipe, export=True, ov_config=ov_config)
 
-                    # Save converted model so we don't convert again
+                    # Save converted model
                     pipe.save_pretrained(model_ov_dir)
                     console.print(f"[bold green]Saved OpenVINO model to {model_ov_dir}[/bold green]")
 
@@ -154,7 +156,6 @@ def get_pipeline(pipe_type, device_key, width=512, height=512, batch_size=1, sch
                 # Reshape to specific static dimensions
                 pipe.reshape(batch_size=1, height=height, width=width, num_images_per_prompt=batch_size)
                 pipe.to(ov_device)
-                # Compilation (Load IR to device)
                 pipe.compile()
 
                 CACHED_PIPELINE = pipe

@@ -7,7 +7,7 @@ from rich.progress import Progress, SpinnerColumn, DownloadColumn, TransferSpeed
 from huggingface_hub import snapshot_download
 
 console = Console()
-MODEL_DIR = "tiny-sd-models"
+MODEL_DIR = "models"
 os.makedirs(MODEL_DIR, exist_ok=True)
 
 def list_models():
