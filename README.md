@@ -1,68 +1,56 @@
-# Tiny-SD CPU Studio
+# Tiny-SD Studio Pro
 
-This repository contains a collection of Python scripts to run the **Segmind Tiny-SD** model on CPU. Tiny-SD is a distilled, lightweight version of Stable Diffusion 1.5, making it ideal for CPU-based generation.
+An optimized Stable Diffusion CLI for Intel CPUs and Integrated GPUs (HD 620, Iris Xe, etc.) using OpenVINO.
 
-## Setup
+## Features
+-   **Hardware Acceleration**: Support for OpenVINO (CPU/GPU) and DirectML.
+-   **Model Management**: Download models from Hugging Face or URL directly within the app.
+-   **Optimization**:
+    -   Uses `DPMSolverMultistepScheduler` (DPM++ 2M Karras) for fast generation (15 steps).
+    -   Static reshaping and compilation for OpenVINO.
+    -   Local model caching to avoid re-downloads/re-conversions.
+-   **Advanced Features**:
+    -   Text-to-Image, Image-to-Image, Inpainting, Outpainting.
+    -   LoRA support.
+    -   Image Variations.
+    -   Negative Prompts, Seed control, Batching.
 
-1.  **Install Dependencies:**
+## Installation
+
+1.  **Install Python 3.10+**
+2.  **Install Dependencies:**
     ```bash
     pip install -r requirements.txt
     ```
 
-## The Easy Way: Tiny-SD Studio
-Run the main interactive script for a cool, user-friendly terminal interface:
-```bash
-python main.py
-```
+## Usage
 
-### Pro Version (CPU & Intel GPU Support)
-If you have an **Intel Integrated GPU (like HD 620)**, use the Pro version to choose between CPU and GPU acceleration:
+Run the main studio script:
 ```bash
 python main_pro.py
 ```
-*Note: To use your Intel GPU on Windows, it is highly recommended to install `torch-directml` (`pip install torch-directml`).*
 
----
+### 1. Hardware Selection
+Choose your accelerator:
+-   **OpenVINO GPU**: Best for Intel Integrated Graphics (Iris Xe, HD 620).
+-   **OpenVINO CPU**: Fast CPU inference.
+-   **Standard CPU**: Slow but compatible fallback.
 
-## Individual Scripts
-If you prefer running specific tasks via command line arguments, you can use these individual scripts:
+### 2. Model Selection
+The app will ask you to select a model.
+-   **Default**: `segmind/tiny-sd` (Fast, distilled SD 1.5).
+-   **Download New**: Select this to download any SD 1.5 based model from Hugging Face or Civitai (direct URL).
+    -   Downloaded models are saved to `tiny-sd-models/`.
+    -   They are automatically converted to OpenVINO format upon first use.
 
-### 1. Text-to-Image
-Generate an image from a text prompt.
-```bash
-python txt2img.py --prompt "A futuristic city in the clouds" --output city.png
-```
+### 3. Generation
+Select a task (e.g., Text to Image) and follow the prompts.
+-   **Samplers**: Choose from DPM++, Euler, etc.
+-   **Dimensions**: For Image-to-Image, the output size matches the input image (rounded to nearest 64px).
 
-### 2. Image-to-Image
-Modify an existing image using a prompt.
-```bash
-python img2img.py --image input.jpg --prompt "Make it a Van Gogh painting" --strength 0.6
-```
+## Adding Models Manually
+You can manually place `.safetensors` files or Diffusers folders into the `tiny-sd-models/` directory. They will appear in the selection menu.
 
-### 3. Inpainting
-Edit a specific part of an image using a mask.
-```bash
-python inpaint.py --image base.png --mask mask.png --prompt "A cat sitting on the chair"
-```
-
-### 4. Outpainting
-Extend the borders of an image.
-```bash
-python outpaint.py --image original.png --prompt "A wide landscape with mountains" --padding 128
-```
-
-### 5. Image Variations
-Generate multiple similar versions of an input image.
-```bash
-python variations.py --image input.png --num_variations 3 --strength 0.4
-```
-
-### 6. LoRA Support
-Generate an image using specific LoRA weights.
-```bash
-python lora_txt2img.py --prompt "A portrait in the style of <lora-name>" --lora "path/to/lora_weights.safetensors"
-```
-
-## Performance Optimizations
--   **CPU-Friendly:** All scripts use `float32` and `pipe.enable_attention_slicing()` to minimize RAM usage and optimize CPU performance.
--   **Speed:** Tiny-SD is up to 80% faster than standard SD 1.5. Expect generations to take ~30-60 seconds on a typical modern CPU.
+## Troubleshooting
+-   **"OpenVINO Load Error"**: If you see errors about `torch.load` vulnerability, the app will try a fallback method. If that fails, consider upgrading `torch`.
+-   **Re-conversion**: Models are converted once per resolution/batch-size configuration. Minor reshaping is fast; full conversion happens only once.
