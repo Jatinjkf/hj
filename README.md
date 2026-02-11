@@ -11,9 +11,21 @@ An optimized Stable Diffusion CLI for Intel CPUs and Integrated GPUs (HD 620, Ir
     -   Local model caching to avoid re-downloads/re-conversions.
 -   **Advanced Features**:
     -   Text-to-Image, Image-to-Image, Inpainting, Outpainting.
-    -   LoRA support.
+    -   LoRA support (Downloader & Selector included).
     -   Image Variations.
     -   Negative Prompts, Seed control, Batching.
+
+## Capabilities & Compatibility
+
+### Supported Models
+This tool is optimized for **Stable Diffusion 1.5** based models.
+-   **Recommended**: `segmind/tiny-sd` (Fast, distilled).
+-   **Compatible**: `runwayml/stable-diffusion-v1-5`, `SG161222/Realistic_Vision_V5.1_noVAE`, `dreamlike-art/dreamlike-photoreal-2.0`, etc.
+-   **Note**: SDXL models are **not** officially supported due to high RAM/VRAM usage and static shape constraints on iGPUs, but may work if you have sufficient hardware (32GB+ RAM).
+
+### Supported LoRAs
+-   Any LoRA trained on **SD 1.5** base models (`.safetensors` format recommended).
+-   You can download LoRAs directly from Hugging Face or via direct URL (e.g., Civitai) using the built-in downloader.
 
 ## Installation
 
@@ -48,8 +60,14 @@ Select a task (e.g., Text to Image) and follow the prompts.
 -   **Samplers**: Choose from DPM++, Euler, etc.
 -   **Dimensions**: For Image-to-Image, the output size matches the input image (rounded to nearest 64px).
 
+### 4. LoRA Usage
+-   Select "Download LoRA" from the main menu to get new styles.
+-   Select "LoRA Text-to-Image" to use them. You can select a downloaded LoRA from the list.
+
 ## Adding Models Manually
-You can manually place `.safetensors` files or Diffusers folders into the `tiny-sd-models/` directory. They will appear in the selection menu.
+You can manually place `.safetensors` files or Diffusers folders into:
+-   Models: `tiny-sd-models/`
+-   LoRAs: `tiny-sd-models/loras/`
 
 ## Troubleshooting
 -   **"OpenVINO Load Error"**: If you see errors about `torch.load` vulnerability, the app will try a fallback method. If that fails, consider upgrading `torch`.

@@ -13,6 +13,7 @@ from io import BytesIO
 import utils
 import shutil
 import model_manager
+import lora_manager
 
 # Suppress warnings
 utils.suppress_warnings()
@@ -238,6 +239,23 @@ def get_common_settings():
         "batch_size": batch_size, "batch_count": batch_count
     }
 
+def select_lora_menu():
+    """Menu to select a LoRA."""
+    loras = lora_manager.list_loras()
+
+    console.print("[bold]Select LoRA:[/bold]")
+    console.print("0. Enter Manual Path / HF ID")
+
+    for i, l in enumerate(loras):
+        console.print(f"{i+1}. {l['name']}")
+
+    choice = Prompt.ask("Choose LoRA", default="0", choices=[str(i) for i in range(len(loras)+1)])
+
+    if choice == "0":
+        return Prompt.ask("Enter path or HF ID")
+    else:
+        return loras[int(choice)-1]["path"]
+
 def run_task(task_name, device_key):
     # Map selection to internal device key
     if device_key == "1": selected_device = "cpu"
@@ -282,13 +300,11 @@ def run_task(task_name, device_key):
         init_image = load_image(img_path)
         if not init_image: return
 
-        # Auto-detect dimensions
         orig_w, orig_h = init_image.size
         width = (orig_w // 64) * 64
         height = (orig_h // 64) * 64
         console.print(f"[dim]Using image dimensions: {width}x{height}[/dim]")
 
-        # Outpainting specific
         if task_name == "Outpainting":
             padding = IntPrompt.ask("Padding pixels", default=128)
             width = ((orig_w + padding*2) // 64) * 64
@@ -300,13 +316,12 @@ def run_task(task_name, device_key):
         strength = 0.75
         if task_name == "Image to Image": strength = FloatPrompt.ask("Strength", default=0.7)
         if task_name == "Variations": strength = FloatPrompt.ask("Strength", default=0.5)
-        
+
         output_base = Prompt.ask("Output filename (base)", default="output_img")
 
         pipe = get_pipeline("img2img", selected_device, width, height, inputs["batch_size"], inputs["scheduler"])
         if not pipe: return
 
-        # Pre-process image
         if task_name == "Outpainting":
             padded_image = ImageOps.expand(init_image, border=padding, fill="gray")
             mask_image = Image.new("L", padded_image.size, 255)
@@ -355,7 +370,9 @@ def run_task(task_name, device_key):
         inputs = get_common_settings()
         width = IntPrompt.ask("Width", default=512)
         height = IntPrompt.ask("Height", default=512)
-        lora_path = Prompt.ask("Enter path or HF ID to LoRA")
+
+        lora_path = select_lora_menu()
+        scale = FloatPrompt.ask("LoRA scale", default=1.0)
         output_base = Prompt.ask("Output filename (base)", default="output_lora")
 
         pipe = get_pipeline("txt2img", selected_device, width, height, inputs["batch_size"], inputs["scheduler"])
@@ -411,7 +428,6 @@ def select_model():
 
     if choice.lower() == "d":
         model_manager.download_menu()
-        # Reload models after download
         return select_model()
 
     try:
@@ -421,7 +437,6 @@ def select_model():
             CURRENT_MODEL_PATH = sel["path"]
             CURRENT_MODEL_TYPE = sel["type"]
             console.print(f"[green]Selected: {sel['name']}[/green]")
-            # Invalidate cache if model changed
             global CACHED_PIPELINE
             CACHED_PIPELINE = None
         else:
@@ -461,19 +476,21 @@ def main():
         table.add_row("5", "LoRA Text-to-Image")
         table.add_row("6", "Variations")
         table.add_row("M", "Change Model")
+        table.add_row("L", "Download LoRA")
         table.add_row("H", "Change Hardware")
         table.add_row("0", "Exit")
         console.print(table)
         
-        choice = Prompt.ask("Select option", choices=["0", "1", "2", "3", "4", "5", "6", "M", "H"], default="1")
+        choice = Prompt.ask("Select option", choices=["0", "1", "2", "3", "4", "5", "6", "M", "L", "H"], default="1")
         
         if choice == "0":
             break
         elif choice == "M":
             select_model()
+        elif choice == "L":
+            lora_manager.download_menu()
         elif choice == "H":
             hw_choice = Prompt.ask("Choose hardware", choices=["1", "2", "3", "4"])
-            # Invalidate cache
             global CACHED_PIPELINE
             CACHED_PIPELINE = None
         else:
