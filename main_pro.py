@@ -11,11 +11,21 @@ from rich.progress import Progress, SpinnerColumn, TextColumn
 import requests
 from io import BytesIO
 import utils
+import shutil
 
 # Suppress warnings
 utils.suppress_warnings()
 
 console = Console()
+
+# Define paths
+LOCAL_MODEL_DIR = "tiny-sd-models"
+OV_MODEL_DIR = os.path.join(LOCAL_MODEL_DIR, "openvino")
+PYTORCH_MODEL_DIR = os.path.join(LOCAL_MODEL_DIR, "pytorch")
+
+os.makedirs(LOCAL_MODEL_DIR, exist_ok=True)
+os.makedirs(OV_MODEL_DIR, exist_ok=True)
+os.makedirs(PYTORCH_MODEL_DIR, exist_ok=True)
 
 def detect_intel_gpu():
     """Detect Intel GPU availability via DirectML or XPU."""
@@ -45,7 +55,7 @@ def load_image(image_path):
         console.print(f"[bold red]Error loading image:[/bold red] {e}")
         return None
 
-def get_pipeline(pipe_type, device_key):
+def get_pipeline(pipe_type, device_key, width=512, height=512, batch_size=1, scheduler_name="DPM++ 2M Karras"):
     model_id = "segmind/tiny-sd"
     
     # Handle OpenVINO separately (CPU or GPU)
@@ -58,49 +68,61 @@ def get_pipeline(pipe_type, device_key):
 
         ov_device = "GPU" if device_key == "openvino_gpu" else "CPU"
 
+        # Check if local OpenVINO model exists
+        # We need to check for model files, e.g., openvino_model.xml for unet/vae/text_encoder
+        # A simple check is if the directory is populated.
+        is_local_ov_available = os.path.exists(os.path.join(OV_MODEL_DIR, "unet", "openvino_model.xml"))
+
+        load_message = f"Loading Tiny-SD (OpenVINO {ov_device})..."
+        if is_local_ov_available:
+            load_message += " [Local Cache]"
+
         with Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
             transient=True,
         ) as progress:
-            progress.add_task(description=f"Loading Tiny-SD (OpenVINO {ov_device})...", total=None)
+            progress.add_task(description=load_message, total=None)
 
             try:
-                # Load OpenVINO pipeline.
-                # If loading via OV directly fails (due to pickle vulnerability), try loading via PyTorch first
-                # then export. PyTorch loading is often more permissive or easier to control.
-                try:
+                if is_local_ov_available:
+                    # Load from local directory
                     if pipe_type == "txt2img":
-                        pipe = OVStableDiffusionPipeline.from_pretrained(model_id, export=True)
+                        pipe = OVStableDiffusionPipeline.from_pretrained(OV_MODEL_DIR)
                     else:
-                        pipe = OVStableDiffusionImg2ImgPipeline.from_pretrained(model_id, export=True)
-                except Exception as e:
-                    # If direct OV load fails, try PyTorch load then convert
-                    console.print(f"[yellow]Direct OpenVINO load failed ({e}), trying via PyTorch conversion...[/yellow]")
-                    pt_pipe_cls = StableDiffusionPipeline if pipe_type == "txt2img" else StableDiffusionImg2ImgPipeline
-                    # Try loading with safe=False if needed (though usually diffusers handles this)
-                    # We might need to handle the specific torch load error by catching it?
-                    # But diffusers usually allows unsafe loading if use_safetensors=False is explicit.
-                    pt_pipe = pt_pipe_cls.from_pretrained(model_id, torch_dtype=torch.float32, use_safetensors=False)
+                        pipe = OVStableDiffusionImg2ImgPipeline.from_pretrained(OV_MODEL_DIR)
+                else:
+                    # Conversion required
+                    console.print("[yellow]First run: Downloading and converting model to OpenVINO... This may take a while.[/yellow]")
+                    try:
+                        # Try direct conversion first
+                        if pipe_type == "txt2img":
+                            pipe = OVStableDiffusionPipeline.from_pretrained(model_id, export=True, cache_dir=PYTORCH_MODEL_DIR)
+                        else:
+                            pipe = OVStableDiffusionImg2ImgPipeline.from_pretrained(model_id, export=True, cache_dir=PYTORCH_MODEL_DIR)
+                    except Exception as e:
+                        console.print(f"[yellow]Direct conversion failed ({e}), trying robust fallback via PyTorch...[/yellow]")
+                        # Robust fallback: Load PT -> Convert -> Save
+                        pt_pipe_cls = StableDiffusionPipeline if pipe_type == "txt2img" else StableDiffusionImg2ImgPipeline
+                        # Load PyTorch model to local cache
+                        pt_pipe = pt_pipe_cls.from_pretrained(model_id, torch_dtype=torch.float32, use_safetensors=False, cache_dir=PYTORCH_MODEL_DIR)
 
-                    if pipe_type == "txt2img":
-                        pipe = OVStableDiffusionPipeline.from_pipe(pt_pipe, export=True)
-                    else:
-                        # Optimum has from_pipe?
-                        # It seems OVStableDiffusionImg2ImgPipeline doesn't have from_pipe directly documented sometimes,
-                        # but it inherits from OVStableDiffusionPipeline which might?
-                        # Actually, OVStableDiffusionPipeline handles both tasks if configured?
-                        # Let's try to convert the components manually or just use the base pipeline.
-                        # For now, let's assume from_pipe works on the base class and we can cast it?
-                        # Or just use the txt2img one for img2img tasks? (It usually works if image arg is supported).
-                        # Let's try standard export on the img2img pipeline class.
-                        pipe = OVStableDiffusionImg2ImgPipeline.from_pipe(pt_pipe, export=True)
+                        if pipe_type == "txt2img":
+                            pipe = OVStableDiffusionPipeline.from_pipe(pt_pipe, export=True)
+                        else:
+                            # Use txt2img pipe for conversion usually safer, then cast?
+                            # Or just use from_pipe on img2img class if supported.
+                            pipe = OVStableDiffusionImg2ImgPipeline.from_pipe(pt_pipe, export=True)
 
-                # Reshape to static shape for best performance on CPU/GPU
-                # Note: Static shapes are critical for OpenVINO performance.
-                # We use 1x512x512. If users want other sizes, this needs to be dynamic or recompiled.
-                # For this CLI, 512x512 is standard.
-                pipe.reshape(batch_size=1, height=512, width=512, num_images_per_prompt=1)
+                    # Save the converted model locally for next time
+                    pipe.save_pretrained(OV_MODEL_DIR)
+                    console.print(f"[bold green]Model converted and saved to {OV_MODEL_DIR}[/bold green]")
+
+                # Configure scheduler BEFORE compilation
+                utils.configure_scheduler(pipe, scheduler_name)
+
+                # Reshape to static shape
+                pipe.reshape(batch_size=1, height=height, width=width, num_images_per_prompt=batch_size)
 
                 # Compile and move to device
                 pipe.to(ov_device)
@@ -141,16 +163,55 @@ def get_pipeline(pipe_type, device_key):
         PipelineClass = StableDiffusionPipeline if pipe_type == "txt2img" else StableDiffusionImg2ImgPipeline
         
         try:
-            pipe = PipelineClass.from_pretrained(model_id, torch_dtype=dtype, use_safetensors=True)
+            pipe = PipelineClass.from_pretrained(model_id, torch_dtype=dtype, use_safetensors=True, cache_dir=PYTORCH_MODEL_DIR)
         except Exception as e:
             console.print(f"[yellow]Safetensors load failed ({e}), falling back to standard weights...[/yellow]")
-            pipe = PipelineClass.from_pretrained(model_id, torch_dtype=dtype, use_safetensors=False)
+            pipe = PipelineClass.from_pretrained(model_id, torch_dtype=dtype, use_safetensors=False, cache_dir=PYTORCH_MODEL_DIR)
 
         pipe = pipe.to(device)
         pipe.enable_attention_slicing()
-        pipe.scheduler = utils.get_optimal_scheduler(pipe)
+        # Configure scheduler
+        utils.configure_scheduler(pipe, scheduler_name)
             
     return pipe
+
+def get_user_inputs(task_name):
+    """Collect common inputs for generation tasks."""
+    prompt = Prompt.ask("Enter your prompt", default="A beautiful digital art of a sunset")
+    neg_prompt = Prompt.ask("Enter negative prompt (optional)", default="")
+    if not neg_prompt: neg_prompt = None
+
+    # Scheduler Selection
+    schedulers = utils.get_scheduler_list()
+    console.print("[bold]Select Sampler:[/bold]")
+    for idx, s in enumerate(schedulers):
+        console.print(f"{idx+1}. {s}")
+
+    sched_choice = IntPrompt.ask("Choose sampler", default=1, choices=[str(i+1) for i in range(len(schedulers))])
+    scheduler_name = schedulers[sched_choice-1]
+
+    steps = IntPrompt.ask("Inference steps", default=15)
+    cfg_scale = FloatPrompt.ask("CFG Scale (Guidance)", default=7.0)
+    seed = IntPrompt.ask("Seed (-1 for random)", default=-1)
+
+    width = IntPrompt.ask("Width", default=512)
+    height = IntPrompt.ask("Height", default=512)
+
+    batch_size = IntPrompt.ask("Batch Size (Images per generation)", default=1)
+    batch_count = IntPrompt.ask("Batch Count (Number of generations)", default=1)
+
+    return {
+        "prompt": prompt,
+        "negative_prompt": neg_prompt,
+        "scheduler": scheduler_name,
+        "steps": steps,
+        "guidance_scale": cfg_scale,
+        "seed": seed,
+        "width": width,
+        "height": height,
+        "batch_size": batch_size,
+        "batch_count": batch_count
+    }
 
 def run_task(task_name, device_key):
     # Map selection to internal device key
@@ -163,74 +224,147 @@ def run_task(task_name, device_key):
     console.print(Panel(f"[bold cyan]{task_name}[/bold cyan] Mode (Running on [bold green]{selected_device.upper()}[/bold green])"))
     
     if task_name == "Text to Image":
-        prompt = Prompt.ask("Enter your prompt", default="A beautiful digital art of a sunset")
-        steps = IntPrompt.ask("Inference steps", default=15)
-        output = Prompt.ask("Output filename", default="output_txt2img.png")
-        output = utils.ensure_extension(output)
+        inputs = get_user_inputs(task_name)
+        output_base = Prompt.ask("Output filename (base)", default="output_txt2img")
         
-        pipe = get_pipeline("txt2img", selected_device)
+        pipe = get_pipeline(
+            "txt2img",
+            selected_device,
+            width=inputs["width"],
+            height=inputs["height"],
+            batch_size=inputs["batch_size"],
+            scheduler_name=inputs["scheduler"]
+        )
         if not pipe: return
 
-        with Progress(SpinnerColumn(), TextColumn("Generating..."), transient=True) as progress:
-            progress.add_task("gen", total=None)
-            image = pipe(prompt=prompt, num_inference_steps=steps).images[0]
-        image.save(output)
-        console.print(f"[bold green]Success![/bold green] File saved to {output}")
+        # Loop for Batch Count
+        total_images = 0
+        for i in range(inputs["batch_count"]):
+            # Set Seed
+            current_seed = inputs["seed"] if inputs["seed"] != -1 else torch.randint(0, 2**32, (1,)).item()
+            generator = torch.manual_seed(current_seed)
+
+            console.print(f"[dim]Batch {i+1}/{inputs['batch_count']} | Seed: {current_seed}[/dim]")
+
+            with Progress(SpinnerColumn(), TextColumn("Generating..."), transient=True) as progress:
+                progress.add_task("gen", total=None)
+                images = pipe(
+                    prompt=inputs["prompt"],
+                    negative_prompt=inputs["negative_prompt"],
+                    num_inference_steps=inputs["steps"],
+                    guidance_scale=inputs["guidance_scale"],
+                    width=inputs["width"],
+                    height=inputs["height"],
+                    num_images_per_prompt=inputs["batch_size"],
+                    generator=generator
+                ).images
+
+            # Save images
+            for j, img in enumerate(images):
+                suffix = f"_{total_images}.png" if (inputs["batch_count"] > 1 or inputs["batch_size"] > 1) else ".png"
+                out_name = f"{output_base}{suffix}"
+                img.save(out_name)
+                total_images += 1
+
+        console.print(f"[bold green]Success![/bold green] Saved {total_images} images.")
         
     elif task_name == "Image to Image":
         img_path = Prompt.ask("Enter path to input image")
         init_image = load_image(img_path)
         if not init_image: return
-        prompt = Prompt.ask("Enter prompt for transformation", default="Cyberpunk style")
+
+        # Reuse get_user_inputs but maybe add strength?
+        inputs = get_user_inputs(task_name)
         strength = FloatPrompt.ask("Strength (0.1 - 0.9)", default=0.7)
-        steps = IntPrompt.ask("Inference steps", default=15)
-        output = Prompt.ask("Output filename", default="output_img2img.png")
-        output = utils.ensure_extension(output)
+        output_base = Prompt.ask("Output filename (base)", default="output_img2img")
         
-        pipe = get_pipeline("img2img", selected_device)
+        pipe = get_pipeline("img2img", selected_device, width=inputs["width"], height=inputs["height"], batch_size=inputs["batch_size"], scheduler_name=inputs["scheduler"])
         if not pipe: return
 
-        init_image = init_image.resize((512, 512))
-        with Progress(SpinnerColumn(), TextColumn("Processing..."), transient=True) as progress:
-            progress.add_task("gen", total=None)
-            image = pipe(prompt=prompt, image=init_image, strength=strength, num_inference_steps=steps).images[0]
-        image.save(output)
-        console.print(f"[bold green]Success![/bold green] File saved to {output}")
+        init_image = init_image.resize((inputs["width"], inputs["height"])) # Resize input to match generation size
+
+        total_images = 0
+        for i in range(inputs["batch_count"]):
+            current_seed = inputs["seed"] if inputs["seed"] != -1 else torch.randint(0, 2**32, (1,)).item()
+            generator = torch.manual_seed(current_seed)
+
+            with Progress(SpinnerColumn(), TextColumn("Processing..."), transient=True) as progress:
+                progress.add_task("gen", total=None)
+                images = pipe(
+                    prompt=inputs["prompt"],
+                    negative_prompt=inputs["negative_prompt"],
+                    image=init_image,
+                    strength=strength,
+                    num_inference_steps=inputs["steps"],
+                    guidance_scale=inputs["guidance_scale"],
+                    num_images_per_prompt=inputs["batch_size"],
+                    generator=generator
+                ).images
+
+            for j, img in enumerate(images):
+                suffix = f"_{total_images}.png" if (inputs["batch_count"] > 1 or inputs["batch_size"] > 1) else ".png"
+                out_name = f"{output_base}{suffix}"
+                img.save(out_name)
+                total_images += 1
+
+        console.print(f"[bold green]Success![/bold green] Saved {total_images} images.")
 
     elif task_name == "Inpainting":
+        # Simplified for now, just adding scheduler/seed support basically
         img_path = Prompt.ask("Enter path to input image")
         mask_path = Prompt.ask("Enter path to mask image")
         init_image = load_image(img_path)
         mask_image = load_image(mask_path)
         if not init_image or not mask_image: return
-        prompt = Prompt.ask("Enter prompt for inpainting")
-        output = Prompt.ask("Output filename", default="output_inpaint.png")
-        output = utils.ensure_extension(output)
         
-        pipe = get_pipeline("img2img", selected_device)
+        inputs = get_user_inputs(task_name)
+        output_base = Prompt.ask("Output filename (base)", default="output_inpaint")
+
+        pipe = get_pipeline("img2img", selected_device, width=inputs["width"], height=inputs["height"], batch_size=inputs["batch_size"], scheduler_name=inputs["scheduler"])
         if not pipe: return
 
-        init_image = init_image.resize((512, 512))
-        mask_image = mask_image.convert("L").resize((512, 512))
+        init_image = init_image.resize((inputs["width"], inputs["height"]))
+        mask_image = mask_image.convert("L").resize((inputs["width"], inputs["height"]))
 
-        with Progress(SpinnerColumn(), TextColumn("Inpainting..."), transient=True) as progress:
-            progress.add_task("gen", total=None)
-            # Use img2img + composite workaround
-            gen = pipe(prompt=prompt, image=init_image, strength=0.75, num_inference_steps=15).images[0]
-            final = Image.composite(gen, init_image, mask_image)
-        final.save(output)
-        console.print(f"[bold green]Success![/bold green] File saved to {output}")
+        total_images = 0
+        for i in range(inputs["batch_count"]):
+            current_seed = inputs["seed"] if inputs["seed"] != -1 else torch.randint(0, 2**32, (1,)).item()
+            generator = torch.manual_seed(current_seed)
+
+            with Progress(SpinnerColumn(), TextColumn("Inpainting..."), transient=True) as progress:
+                progress.add_task("gen", total=None)
+                # Use img2img + composite workaround
+                gens = pipe(
+                    prompt=inputs["prompt"],
+                    negative_prompt=inputs["negative_prompt"],
+                    image=init_image,
+                    strength=0.75,
+                    num_inference_steps=inputs["steps"],
+                    guidance_scale=inputs["guidance_scale"],
+                    num_images_per_prompt=inputs["batch_size"],
+                    generator=generator
+                ).images
+
+                for gen in gens:
+                    final = Image.composite(gen, init_image, mask_image)
+                    suffix = f"_{total_images}.png" if (inputs["batch_count"] > 1 or inputs["batch_size"] > 1) else ".png"
+                    out_name = f"{output_base}{suffix}"
+                    final.save(out_name)
+                    total_images += 1
+
+        console.print(f"[bold green]Success![/bold green] Saved {total_images} images.")
 
     elif task_name == "Outpainting":
+        # Similar updates...
         img_path = Prompt.ask("Enter path to input image")
         init_image = load_image(img_path)
         if not init_image: return
-        prompt = Prompt.ask("Enter prompt describing the full scene")
+
+        inputs = get_user_inputs(task_name)
         padding = IntPrompt.ask("Padding pixels", default=128)
-        output = Prompt.ask("Output filename", default="output_outpaint.png")
-        output = utils.ensure_extension(output)
+        output_base = Prompt.ask("Output filename (base)", default="output_outpaint")
         
-        pipe = get_pipeline("img2img", selected_device)
+        pipe = get_pipeline("img2img", selected_device, width=512, height=512, batch_size=inputs["batch_size"], scheduler_name=inputs["scheduler"]) # Force 512 for outpaint logic simplicity
         if not pipe: return
 
         padded_image = ImageOps.expand(init_image, border=padding, fill="gray")
@@ -238,35 +372,49 @@ def run_task(task_name, device_key):
         mask_image.paste(0, (padding, padding, padding + init_image.size[0], padding + init_image.size[1]))
         
         orig_size = padded_image.size
-        input_image = padded_image.resize((512, 512))
-        with Progress(SpinnerColumn(), TextColumn("Outpainting..."), transient=True) as progress:
-            progress.add_task("gen", total=None)
-            gen = pipe(prompt=prompt, image=input_image, strength=0.8, num_inference_steps=15).images[0]
-            gen = gen.resize(orig_size)
-            final = Image.composite(gen, padded_image, mask_image)
-        final.save(output)
-        console.print(f"[bold green]Success![/bold green] File saved to {output}")
+        input_image = padded_image.resize((512, 512)) # Hardcoded logic in previous steps, keeping it simple
+
+        total_images = 0
+        for i in range(inputs["batch_count"]):
+            current_seed = inputs["seed"] if inputs["seed"] != -1 else torch.randint(0, 2**32, (1,)).item()
+            generator = torch.manual_seed(current_seed)
+
+            with Progress(SpinnerColumn(), TextColumn("Outpainting..."), transient=True) as progress:
+                progress.add_task("gen", total=None)
+                gens = pipe(
+                    prompt=inputs["prompt"],
+                    negative_prompt=inputs["negative_prompt"],
+                    image=input_image,
+                    strength=0.8,
+                    num_inference_steps=inputs["steps"],
+                    guidance_scale=inputs["guidance_scale"],
+                    num_images_per_prompt=inputs["batch_size"],
+                    generator=generator
+                ).images
+
+                for gen in gens:
+                    gen = gen.resize(orig_size)
+                    final = Image.composite(gen, padded_image, mask_image)
+                    suffix = f"_{total_images}.png" if (inputs["batch_count"] > 1 or inputs["batch_size"] > 1) else ".png"
+                    out_name = f"{output_base}{suffix}"
+                    final.save(out_name)
+                    total_images += 1
+        console.print(f"[bold green]Success![/bold green] Saved {total_images} images.")
 
     elif task_name == "LoRA Text-to-Image":
-        prompt = Prompt.ask("Enter your prompt", default="A beautiful digital art")
+        inputs = get_user_inputs(task_name)
         lora_path = Prompt.ask("Enter path or HF ID to LoRA")
-        steps = IntPrompt.ask("Inference steps", default=15)
-        # Note: OpenVINO pipeline might not support dynamic scaling easily without fusing.
-        # We will assume simple loading.
-        output = Prompt.ask("Output filename", default="output_lora.png")
-        output = utils.ensure_extension(output)
+        scale = FloatPrompt.ask("LoRA scale", default=1.0)
+        output_base = Prompt.ask("Output filename (base)", default="output_lora")
 
-        pipe = get_pipeline("txt2img", selected_device)
+        pipe = get_pipeline("txt2img", selected_device, width=inputs["width"], height=inputs["height"], batch_size=inputs["batch_size"], scheduler_name=inputs["scheduler"])
         if not pipe: return
 
         with Progress(SpinnerColumn(), TextColumn("Loading LoRA..."), transient=True) as progress:
              progress.add_task("gen", total=None)
              try:
-                 # Check if load_lora_weights is available (Optimum 1.14+)
                  if hasattr(pipe, "load_lora_weights"):
                      pipe.load_lora_weights(lora_path)
-                     # For OpenVINO, we might need to recompile if shapes change, but usually weights are just updated.
-                     # However, OV pipelines often fuse adapters.
                  else:
                      console.print("[bold red]Error:[/bold red] This version of Optimum Intel might not support LoRA loading directly.")
                      return
@@ -274,34 +422,86 @@ def run_task(task_name, device_key):
                  console.print(f"[bold red]Error loading LoRA:[/bold red] {e}")
                  return
 
-        with Progress(SpinnerColumn(), TextColumn("Generating..."), transient=True) as progress:
-            progress.add_task("gen", total=None)
-            image = pipe(prompt=prompt, num_inference_steps=steps).images[0]
+        total_images = 0
+        for i in range(inputs["batch_count"]):
+            current_seed = inputs["seed"] if inputs["seed"] != -1 else torch.randint(0, 2**32, (1,)).item()
+            generator = torch.manual_seed(current_seed)
 
-        image.save(output)
-        console.print(f"[bold green]Success![/bold green] File saved to {output}")
+            with Progress(SpinnerColumn(), TextColumn("Generating..."), transient=True) as progress:
+                progress.add_task("gen", total=None)
+                if "openvino" in selected_device:
+                    images = pipe(
+                        prompt=inputs["prompt"],
+                        negative_prompt=inputs["negative_prompt"],
+                        num_inference_steps=inputs["steps"],
+                        guidance_scale=inputs["guidance_scale"],
+                        width=inputs["width"],
+                        height=inputs["height"],
+                        num_images_per_prompt=inputs["batch_size"],
+                        generator=generator
+                    ).images
+                else:
+                    images = pipe(
+                        prompt=inputs["prompt"],
+                        negative_prompt=inputs["negative_prompt"],
+                        num_inference_steps=inputs["steps"],
+                        guidance_scale=inputs["guidance_scale"],
+                        width=inputs["width"],
+                        height=inputs["height"],
+                        num_images_per_prompt=inputs["batch_size"],
+                        generator=generator,
+                        cross_attention_kwargs={"scale": scale} if scale != 1.0 else None
+                    ).images
+
+            for img in images:
+                suffix = f"_{total_images}.png" if (inputs["batch_count"] > 1 or inputs["batch_size"] > 1) else ".png"
+                out_name = f"{output_base}{suffix}"
+                img.save(out_name)
+                total_images += 1
+
+        console.print(f"[bold green]Success![/bold green] Saved {total_images} images.")
 
     elif task_name == "Variations":
         img_path = Prompt.ask("Enter path to input image")
         init_image = load_image(img_path)
         if not init_image: return
-        num_vars = IntPrompt.ask("Number of variations", default=3)
-        strength = FloatPrompt.ask("Strength (0.1 - 0.9)", default=0.5)
-        steps = IntPrompt.ask("Inference steps", default=15)
 
-        pipe = get_pipeline("img2img", selected_device)
+        inputs = get_user_inputs(task_name)
+        strength = FloatPrompt.ask("Strength (0.1 - 0.9)", default=0.5)
+
+        # Override batch counts? Or just use them.
+        # Usually variations imply we want batch_count * batch_size variations.
+
+        pipe = get_pipeline("img2img", selected_device, width=inputs["width"], height=inputs["height"], batch_size=inputs["batch_size"], scheduler_name=inputs["scheduler"])
         if not pipe: return
 
-        init_image = init_image.resize((512, 512))
+        init_image = init_image.resize((inputs["width"], inputs["height"]))
 
-        with Progress(SpinnerColumn(), TextColumn("Generating Variations..."), transient=True) as progress:
-            progress.add_task("gen", total=None)
-            for i in range(num_vars):
+        total_images = 0
+        for i in range(inputs["batch_count"]):
+            current_seed = inputs["seed"] if inputs["seed"] != -1 else torch.randint(0, 2**32, (1,)).item()
+            generator = torch.manual_seed(current_seed)
+
+            with Progress(SpinnerColumn(), TextColumn("Generating Variations..."), transient=True) as progress:
+                progress.add_task("gen", total=None)
                 # Empty prompt allows the image to guide the generation entirely (with strength)
-                image = pipe(prompt="", image=init_image, strength=strength, num_inference_steps=steps).images[0]
-                output = f"variation_{i+1}.png"
-                image.save(output)
-                console.print(f"Saved {output}")
+                images = pipe(
+                    prompt="",
+                    negative_prompt=inputs["negative_prompt"],
+                    image=init_image,
+                    strength=strength,
+                    num_inference_steps=inputs["steps"],
+                    guidance_scale=inputs["guidance_scale"],
+                    num_images_per_prompt=inputs["batch_size"],
+                    generator=generator
+                ).images
+
+                for img in images:
+                    suffix = f"_{total_images}.png"
+                    out_name = f"variation_{total_images+1}.png"
+                    img.save(out_name)
+                    total_images += 1
+                    console.print(f"Saved {out_name}")
 
         console.print(f"[bold green]All variations saved![/bold green]")
 
