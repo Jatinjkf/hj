@@ -22,10 +22,16 @@ console = Console()
 LOCAL_MODEL_DIR = "tiny-sd-models"
 OV_MODEL_DIR = os.path.join(LOCAL_MODEL_DIR, "openvino")
 PYTORCH_MODEL_DIR = os.path.join(LOCAL_MODEL_DIR, "pytorch")
+OV_CACHE_DIR = os.path.join(LOCAL_MODEL_DIR, "openvino_cache")
 
 os.makedirs(LOCAL_MODEL_DIR, exist_ok=True)
 os.makedirs(OV_MODEL_DIR, exist_ok=True)
 os.makedirs(PYTORCH_MODEL_DIR, exist_ok=True)
+os.makedirs(OV_CACHE_DIR, exist_ok=True)
+
+# Global cache for pipeline
+CACHED_PIPELINE = None
+CACHED_CONFIG = {}
 
 def detect_intel_gpu():
     """Detect Intel GPU availability via DirectML or XPU."""
@@ -56,8 +62,46 @@ def load_image(image_path):
         return None
 
 def get_pipeline(pipe_type, device_key, width=512, height=512, batch_size=1, scheduler_name="DPM++ 2M Karras"):
+    global CACHED_PIPELINE, CACHED_CONFIG
+
     model_id = "segmind/tiny-sd"
     
+    # Check if we can reuse the cached pipeline
+    if CACHED_PIPELINE is not None and CACHED_CONFIG.get("device_key") == device_key:
+
+        # If running OpenVINO, check if reshape/recompile is needed
+        if device_key in ["openvino_cpu", "openvino_gpu"]:
+            current_dims = (CACHED_CONFIG.get("width"), CACHED_CONFIG.get("height"), CACHED_CONFIG.get("batch_size"))
+            new_dims = (width, height, batch_size)
+
+            if current_dims == new_dims:
+                # Fully cached, just update scheduler if needed
+                utils.configure_scheduler(CACHED_PIPELINE, scheduler_name)
+                return CACHED_PIPELINE
+            else:
+                # Dimensions changed, reshape and compile
+                console.print(f"[dim]Reshaping OpenVINO model from {current_dims} to {new_dims}...[/dim]")
+                try:
+                    CACHED_PIPELINE.reshape(batch_size=1, height=height, width=width, num_images_per_prompt=batch_size)
+                    ov_device = "GPU" if device_key == "openvino_gpu" else "CPU"
+                    CACHED_PIPELINE.compile() # Recompile with new shape
+
+                    # Update cache config
+                    CACHED_CONFIG.update({"width": width, "height": height, "batch_size": batch_size})
+                    utils.configure_scheduler(CACHED_PIPELINE, scheduler_name)
+                    return CACHED_PIPELINE
+                except Exception as e:
+                    console.print(f"[yellow]Reshape/Compile failed ({e}), reloading pipeline...[/yellow]")
+                    # If reshape fails, fall through to reload
+
+        else:
+            # PyTorch pipeline usually handles dynamic shapes fine, no reshape needed
+            # Unless we want to be strict, but usually safe to reuse
+            utils.configure_scheduler(CACHED_PIPELINE, scheduler_name)
+            return CACHED_PIPELINE
+
+    # If we are here, we need to load a new pipeline
+
     # Handle OpenVINO separately (CPU or GPU)
     if device_key in ["openvino_cpu", "openvino_gpu"]:
         try:
@@ -69,13 +113,12 @@ def get_pipeline(pipe_type, device_key, width=512, height=512, batch_size=1, sch
         ov_device = "GPU" if device_key == "openvino_gpu" else "CPU"
 
         # Check if local OpenVINO model exists
-        # We need to check for model files, e.g., openvino_model.xml for unet/vae/text_encoder
-        # A simple check is if the directory is populated.
-        is_local_ov_available = os.path.exists(os.path.join(OV_MODEL_DIR, "unet", "openvino_model.xml"))
+        is_local_ov_available = os.path.exists(os.path.join(OV_MODEL_DIR, "model_index.json"))
 
-        load_message = f"Loading Tiny-SD (OpenVINO {ov_device})..."
         if is_local_ov_available:
-            load_message += " [Local Cache]"
+            load_message = f"Loading converted OpenVINO model from {OV_MODEL_DIR}..."
+        else:
+            load_message = f"First run: converting PyTorch model to OpenVINO (this takes time)..."
 
         with Progress(
             SpinnerColumn(),
@@ -85,21 +128,22 @@ def get_pipeline(pipe_type, device_key, width=512, height=512, batch_size=1, sch
             progress.add_task(description=load_message, total=None)
 
             try:
+                ov_config = {"CACHE_DIR": OV_CACHE_DIR} # Enable compilation caching
+
                 if is_local_ov_available:
                     # Load from local directory
                     if pipe_type == "txt2img":
-                        pipe = OVStableDiffusionPipeline.from_pretrained(OV_MODEL_DIR)
+                        pipe = OVStableDiffusionPipeline.from_pretrained(OV_MODEL_DIR, ov_config=ov_config)
                     else:
-                        pipe = OVStableDiffusionImg2ImgPipeline.from_pretrained(OV_MODEL_DIR)
+                        pipe = OVStableDiffusionImg2ImgPipeline.from_pretrained(OV_MODEL_DIR, ov_config=ov_config)
                 else:
                     # Conversion required
-                    console.print("[yellow]First run: Downloading and converting model to OpenVINO... This may take a while.[/yellow]")
                     try:
                         # Try direct conversion first
                         if pipe_type == "txt2img":
-                            pipe = OVStableDiffusionPipeline.from_pretrained(model_id, export=True, cache_dir=PYTORCH_MODEL_DIR)
+                            pipe = OVStableDiffusionPipeline.from_pretrained(model_id, export=True, cache_dir=PYTORCH_MODEL_DIR, ov_config=ov_config)
                         else:
-                            pipe = OVStableDiffusionImg2ImgPipeline.from_pretrained(model_id, export=True, cache_dir=PYTORCH_MODEL_DIR)
+                            pipe = OVStableDiffusionImg2ImgPipeline.from_pretrained(model_id, export=True, cache_dir=PYTORCH_MODEL_DIR, ov_config=ov_config)
                     except Exception as e:
                         console.print(f"[yellow]Direct conversion failed ({e}), trying robust fallback via PyTorch...[/yellow]")
                         # Robust fallback: Load PT -> Convert -> Save
@@ -108,11 +152,9 @@ def get_pipeline(pipe_type, device_key, width=512, height=512, batch_size=1, sch
                         pt_pipe = pt_pipe_cls.from_pretrained(model_id, torch_dtype=torch.float32, use_safetensors=False, cache_dir=PYTORCH_MODEL_DIR)
 
                         if pipe_type == "txt2img":
-                            pipe = OVStableDiffusionPipeline.from_pipe(pt_pipe, export=True)
+                            pipe = OVStableDiffusionPipeline.from_pipe(pt_pipe, export=True, ov_config=ov_config)
                         else:
-                            # Use txt2img pipe for conversion usually safer, then cast?
-                            # Or just use from_pipe on img2img class if supported.
-                            pipe = OVStableDiffusionImg2ImgPipeline.from_pipe(pt_pipe, export=True)
+                            pipe = OVStableDiffusionImg2ImgPipeline.from_pipe(pt_pipe, export=True, ov_config=ov_config)
 
                     # Save the converted model locally for next time
                     pipe.save_pretrained(OV_MODEL_DIR)
@@ -127,6 +169,16 @@ def get_pipeline(pipe_type, device_key, width=512, height=512, batch_size=1, sch
                 # Compile and move to device
                 pipe.to(ov_device)
                 pipe.compile()
+
+                # Update global cache
+                CACHED_PIPELINE = pipe
+                CACHED_CONFIG = {
+                    "device_key": device_key,
+                    "width": width,
+                    "height": height,
+                    "batch_size": batch_size,
+                    "pipe_type": pipe_type
+                }
 
             except Exception as e:
                 console.print(f"[bold red]OpenVINO Load/Compile Error:[/bold red] {e}")
@@ -172,11 +224,21 @@ def get_pipeline(pipe_type, device_key, width=512, height=512, batch_size=1, sch
         pipe.enable_attention_slicing()
         # Configure scheduler
         utils.configure_scheduler(pipe, scheduler_name)
+
+        # Update global cache (standard PT pipeline is easier to reuse)
+        CACHED_PIPELINE = pipe
+        CACHED_CONFIG = {
+            "device_key": device_key,
+            "width": width, # Usually irrelevant for PT but kept for consistency
+            "height": height,
+            "batch_size": batch_size,
+            "pipe_type": pipe_type
+        }
             
     return pipe
 
-def get_user_inputs(task_name):
-    """Collect common inputs for generation tasks."""
+def get_common_settings():
+    """Collect common settings for all tasks."""
     prompt = Prompt.ask("Enter your prompt", default="A beautiful digital art of a sunset")
     neg_prompt = Prompt.ask("Enter negative prompt (optional)", default="")
     if not neg_prompt: neg_prompt = None
@@ -194,9 +256,6 @@ def get_user_inputs(task_name):
     cfg_scale = FloatPrompt.ask("CFG Scale (Guidance)", default=7.0)
     seed = IntPrompt.ask("Seed (-1 for random)", default=-1)
 
-    width = IntPrompt.ask("Width", default=512)
-    height = IntPrompt.ask("Height", default=512)
-
     batch_size = IntPrompt.ask("Batch Size (Images per generation)", default=1)
     batch_count = IntPrompt.ask("Batch Count (Number of generations)", default=1)
 
@@ -207,8 +266,6 @@ def get_user_inputs(task_name):
         "steps": steps,
         "guidance_scale": cfg_scale,
         "seed": seed,
-        "width": width,
-        "height": height,
         "batch_size": batch_size,
         "batch_count": batch_count
     }
@@ -224,14 +281,16 @@ def run_task(task_name, device_key):
     console.print(Panel(f"[bold cyan]{task_name}[/bold cyan] Mode (Running on [bold green]{selected_device.upper()}[/bold green])"))
     
     if task_name == "Text to Image":
-        inputs = get_user_inputs(task_name)
+        inputs = get_common_settings()
+        width = IntPrompt.ask("Width", default=512)
+        height = IntPrompt.ask("Height", default=512)
         output_base = Prompt.ask("Output filename (base)", default="output_txt2img")
         
         pipe = get_pipeline(
             "txt2img",
             selected_device,
-            width=inputs["width"],
-            height=inputs["height"],
+            width=width,
+            height=height,
             batch_size=inputs["batch_size"],
             scheduler_name=inputs["scheduler"]
         )
@@ -253,8 +312,8 @@ def run_task(task_name, device_key):
                     negative_prompt=inputs["negative_prompt"],
                     num_inference_steps=inputs["steps"],
                     guidance_scale=inputs["guidance_scale"],
-                    width=inputs["width"],
-                    height=inputs["height"],
+                    width=width,
+                    height=height,
                     num_images_per_prompt=inputs["batch_size"],
                     generator=generator
                 ).images
@@ -273,15 +332,24 @@ def run_task(task_name, device_key):
         init_image = load_image(img_path)
         if not init_image: return
 
-        # Reuse get_user_inputs but maybe add strength?
-        inputs = get_user_inputs(task_name)
+        # Determine width/height from loaded image
+        # Round to nearest 64
+        orig_w, orig_h = init_image.size
+        # For OpenVINO static shapes, we want multiples of 8 or 64 usually.
+        # But we need to define width/height for pipe compilation.
+        width = (orig_w // 64) * 64
+        height = (orig_h // 64) * 64
+
+        console.print(f"[dim]Using image dimensions: {width}x{height}[/dim]")
+
+        inputs = get_common_settings()
         strength = FloatPrompt.ask("Strength (0.1 - 0.9)", default=0.7)
         output_base = Prompt.ask("Output filename (base)", default="output_img2img")
         
-        pipe = get_pipeline("img2img", selected_device, width=inputs["width"], height=inputs["height"], batch_size=inputs["batch_size"], scheduler_name=inputs["scheduler"])
+        pipe = get_pipeline("img2img", selected_device, width=width, height=height, batch_size=inputs["batch_size"], scheduler_name=inputs["scheduler"])
         if not pipe: return
 
-        init_image = init_image.resize((inputs["width"], inputs["height"])) # Resize input to match generation size
+        init_image = init_image.resize((width, height)) # Resize input to match generation size
 
         total_images = 0
         for i in range(inputs["batch_count"]):
@@ -310,21 +378,25 @@ def run_task(task_name, device_key):
         console.print(f"[bold green]Success![/bold green] Saved {total_images} images.")
 
     elif task_name == "Inpainting":
-        # Simplified for now, just adding scheduler/seed support basically
         img_path = Prompt.ask("Enter path to input image")
         mask_path = Prompt.ask("Enter path to mask image")
         init_image = load_image(img_path)
         mask_image = load_image(mask_path)
         if not init_image or not mask_image: return
         
-        inputs = get_user_inputs(task_name)
+        orig_w, orig_h = init_image.size
+        width = (orig_w // 64) * 64
+        height = (orig_h // 64) * 64
+        console.print(f"[dim]Using image dimensions: {width}x{height}[/dim]")
+
+        inputs = get_common_settings()
         output_base = Prompt.ask("Output filename (base)", default="output_inpaint")
 
-        pipe = get_pipeline("img2img", selected_device, width=inputs["width"], height=inputs["height"], batch_size=inputs["batch_size"], scheduler_name=inputs["scheduler"])
+        pipe = get_pipeline("img2img", selected_device, width=width, height=height, batch_size=inputs["batch_size"], scheduler_name=inputs["scheduler"])
         if not pipe: return
 
-        init_image = init_image.resize((inputs["width"], inputs["height"]))
-        mask_image = mask_image.convert("L").resize((inputs["width"], inputs["height"]))
+        init_image = init_image.resize((width, height))
+        mask_image = mask_image.convert("L").resize((width, height))
 
         total_images = 0
         for i in range(inputs["batch_count"]):
@@ -360,19 +432,27 @@ def run_task(task_name, device_key):
         init_image = load_image(img_path)
         if not init_image: return
 
-        inputs = get_user_inputs(task_name)
+        inputs = get_common_settings()
         padding = IntPrompt.ask("Padding pixels", default=128)
         output_base = Prompt.ask("Output filename (base)", default="output_outpaint")
+
+        # Calculate size after padding
+        padded_w = init_image.width + (padding * 2)
+        padded_h = init_image.height + (padding * 2)
+        width = (padded_w // 64) * 64
+        height = (padded_h // 64) * 64
+        console.print(f"[dim]Padded image dimensions: {width}x{height}[/dim]")
         
-        pipe = get_pipeline("img2img", selected_device, width=512, height=512, batch_size=inputs["batch_size"], scheduler_name=inputs["scheduler"]) # Force 512 for outpaint logic simplicity
+        pipe = get_pipeline("img2img", selected_device, width=width, height=height, batch_size=inputs["batch_size"], scheduler_name=inputs["scheduler"])
         if not pipe: return
 
         padded_image = ImageOps.expand(init_image, border=padding, fill="gray")
         mask_image = Image.new("L", padded_image.size, 255)
         mask_image.paste(0, (padding, padding, padding + init_image.size[0], padding + init_image.size[1]))
         
+        # Resize to multiple of 64
         orig_size = padded_image.size
-        input_image = padded_image.resize((512, 512)) # Hardcoded logic in previous steps, keeping it simple
+        input_image = padded_image.resize((width, height))
 
         total_images = 0
         for i in range(inputs["batch_count"]):
@@ -402,12 +482,15 @@ def run_task(task_name, device_key):
         console.print(f"[bold green]Success![/bold green] Saved {total_images} images.")
 
     elif task_name == "LoRA Text-to-Image":
-        inputs = get_user_inputs(task_name)
+        inputs = get_common_settings()
+        width = IntPrompt.ask("Width", default=512)
+        height = IntPrompt.ask("Height", default=512)
+
         lora_path = Prompt.ask("Enter path or HF ID to LoRA")
         scale = FloatPrompt.ask("LoRA scale", default=1.0)
         output_base = Prompt.ask("Output filename (base)", default="output_lora")
 
-        pipe = get_pipeline("txt2img", selected_device, width=inputs["width"], height=inputs["height"], batch_size=inputs["batch_size"], scheduler_name=inputs["scheduler"])
+        pipe = get_pipeline("txt2img", selected_device, width=width, height=height, batch_size=inputs["batch_size"], scheduler_name=inputs["scheduler"])
         if not pipe: return
 
         with Progress(SpinnerColumn(), TextColumn("Loading LoRA..."), transient=True) as progress:
@@ -435,8 +518,8 @@ def run_task(task_name, device_key):
                         negative_prompt=inputs["negative_prompt"],
                         num_inference_steps=inputs["steps"],
                         guidance_scale=inputs["guidance_scale"],
-                        width=inputs["width"],
-                        height=inputs["height"],
+                        width=width,
+                        height=height,
                         num_images_per_prompt=inputs["batch_size"],
                         generator=generator
                     ).images
@@ -446,8 +529,8 @@ def run_task(task_name, device_key):
                         negative_prompt=inputs["negative_prompt"],
                         num_inference_steps=inputs["steps"],
                         guidance_scale=inputs["guidance_scale"],
-                        width=inputs["width"],
-                        height=inputs["height"],
+                        width=width,
+                        height=height,
                         num_images_per_prompt=inputs["batch_size"],
                         generator=generator,
                         cross_attention_kwargs={"scale": scale} if scale != 1.0 else None
@@ -466,16 +549,18 @@ def run_task(task_name, device_key):
         init_image = load_image(img_path)
         if not init_image: return
 
-        inputs = get_user_inputs(task_name)
+        orig_w, orig_h = init_image.size
+        width = (orig_w // 64) * 64
+        height = (orig_h // 64) * 64
+        console.print(f"[dim]Using image dimensions: {width}x{height}[/dim]")
+
+        inputs = get_common_settings()
         strength = FloatPrompt.ask("Strength (0.1 - 0.9)", default=0.5)
 
-        # Override batch counts? Or just use them.
-        # Usually variations imply we want batch_count * batch_size variations.
-
-        pipe = get_pipeline("img2img", selected_device, width=inputs["width"], height=inputs["height"], batch_size=inputs["batch_size"], scheduler_name=inputs["scheduler"])
+        pipe = get_pipeline("img2img", selected_device, width=width, height=height, batch_size=inputs["batch_size"], scheduler_name=inputs["scheduler"])
         if not pipe: return
 
-        init_image = init_image.resize((inputs["width"], inputs["height"]))
+        init_image = init_image.resize((width, height))
 
         total_images = 0
         for i in range(inputs["batch_count"]):
