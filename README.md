@@ -11,7 +11,7 @@ An optimized Stable Diffusion CLI for Intel CPUs and Integrated GPUs (HD 620, Ir
     -   Local model caching to avoid re-downloads/re-conversions.
 -   **Advanced Features**:
     -   Text-to-Image, Image-to-Image, Inpainting, Outpainting.
-    -   LoRA support (Downloader & Selector included).
+    -   LoRA support (Selectable for any task).
     -   Image Variations.
     -   Negative Prompts, Seed control, Batching.
 
@@ -52,22 +52,21 @@ Choose your accelerator:
 The app will ask you to select a model.
 -   **Default**: `segmind/tiny-sd` (Fast, distilled SD 1.5).
 -   **Download New**: Select this to download any SD 1.5 based model from Hugging Face or Civitai (direct URL).
-    -   Downloaded models are saved to `models/`.
+    -   Downloaded models are saved to `Models/`.
     -   They are automatically converted to OpenVINO format upon first use.
 
-### 3. Generation
-Select a task (e.g., Text to Image) and follow the prompts.
+### 3. LoRA Selection (Optional)
+Use "Download LoRA" to get style files. Then use "Select LoRA" to apply a style to all subsequent generations.
+
+### 4. Generation
+Select a task (e.g., Text to Image, Inpainting) and follow the prompts.
 -   **Samplers**: Choose from DPM++, Euler, etc.
 -   **Dimensions**: For Image-to-Image, the output size matches the input image (rounded to nearest 64px).
 
-### 4. LoRA Usage
--   Select "Download LoRA" from the main menu to get new styles.
--   Select "LoRA Text-to-Image" to use them. You can select a downloaded LoRA from the list.
-
 ## Adding Models Manually
 You can manually place `.safetensors` files or Diffusers folders into:
--   Models: `models/`
--   LoRAs: `models/loras/`
+-   Models: `Models/`
+-   LoRAs: `Models/loras/`
 
 **Supported Files:**
 -   `.safetensors` (Strongly Recommended)
