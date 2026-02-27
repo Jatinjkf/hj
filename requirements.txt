@@ -7,3 +7,6 @@ numpy
 requests
 safetensors
 rich
+optimum-intel[openvino]
+openvino
+onnx
